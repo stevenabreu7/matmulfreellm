@@ -23,7 +23,96 @@ from mmfreelm.modules.activations import swiglu_linear, swiglu
 #from mmfreelm.ops.bitnet import BitLinear_Fuse as BitLinear
 from mmfreelm.ops.fusedbitnet import FusedBitLinear as BitLinear
 
+from torch.quantization.observer import MinMaxObserver, MovingAverageMinMaxObserver
+
 logger = logging.get_logger(__name__)
+
+
+class CustomFakeQuantize(nn.Module):
+    def __init__(self, 
+                 quant_min=-128, 
+                 quant_max=127, 
+                 dtype=torch.qint8, 
+                 qscheme=torch.per_tensor_symmetric, 
+                 observer=MinMaxObserver):
+        super().__init__()
+        self.quant_min = quant_min
+        self.quant_max = quant_max
+        self.dtype = dtype
+        self.qscheme = qscheme
+
+        # Initialize the observer
+        self.activation_post_process = observer(dtype=self.dtype, qscheme=self.qscheme)
+        self.scale = None
+        self.zero_point = None
+
+        # debugging information
+        self.mean_error = []
+
+    def forward(self, x):
+        # Ensure the input is float32
+        xdtype = x.dtype
+        if x.dtype != torch.float32:
+            x = x.float()
+        
+        # Update the observer with the current batch data
+        self.activation_post_process(x)
+        
+        # Get quantization parameters from the observer
+        self.calculate_qparams()
+        
+        # Apply fake quantization to simulate quantization during training
+        x_pre = x.detach().cpu()
+        x = self.quantize_dequantize(x)
+
+        # Compute quantization errors and log them
+        err_abs = (x.detach().cpu() - x_pre).abs().mean().item()
+        err_rel = err_abs / x_pre.abs().mean().item()
+        self.mean_error.append(err_rel)
+
+        return x.to(dtype=xdtype)
+    
+    def print_error_summary(self):
+        mean_error = torch.tensor(self.mean_error)
+        print(f"   Relative error: {mean_error.mean().item():6.2%} +/- {mean_error.std().item():6.2%}", end=" ")
+        print(f"(min: {mean_error.min().item():6.2%}, max: {mean_error.max().item():6.2%})")
+
+    def calculate_qparams(self):
+        # Obtain min and max from the observer
+        min_val, max_val = self.activation_post_process.min_val, self.activation_post_process.max_val
+
+        # Compute scale and zero_point based on min and max
+        if self.qscheme == torch.per_tensor_symmetric:
+            max_abs = torch.max(-min_val, max_val)
+            self.scale = max_abs / ((self.quant_max - self.quant_min) / 2)
+            self.zero_point = 0
+        elif self.qscheme == torch.per_tensor_affine:
+            self.scale = (max_val - min_val) / (self.quant_max - self.quant_min)
+            self.zero_point = self.quant_min - torch.round(min_val / self.scale)
+            self.zero_point = self.zero_point.clamp(self.quant_min, self.quant_max)
+        else:
+            raise ValueError(f'Unsupported quantization scheme: {self.qscheme}')
+
+    def quantize_dequantize(self, x):
+        # Quantize
+        x_quantized = x / self.scale + self.zero_point
+        if self.dtype == torch.qint8 or self.dtype == torch.quint8:
+            x_quantized = x_quantized.clamp(self.quant_min, self.quant_max)
+        else:
+            raise ValueError(f'Unsupported dtype: {self.dtype}')
+        x_quantized = torch.round(x_quantized)
+        
+        # Dequantize
+        x_dequantized = (x_quantized - self.zero_point) * self.scale
+        return x_dequantized
+
+
+class DummyQuantize(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return x
 
 
 class HGRNBitMLP(nn.Module):
@@ -60,7 +149,7 @@ class HGRNBitMLP(nn.Module):
 
 
 class HGRNBitBlock(nn.Module):
-    def __init__(self, config: HGRNBitConfig, layer_idx: int):
+    def __init__(self, config: HGRNBitConfig, layer_idx: int, fake_quant: bool = True):
         super().__init__()
         self.hidden_size = config.hidden_size
 
@@ -83,6 +172,13 @@ class HGRNBitBlock(nn.Module):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act
         )
+        self.fake_quant = fake_quant
+        self.quant_input = CustomFakeQuantize() if self.fake_quant else DummyQuantize()
+        self.quant_postnorm1 = CustomFakeQuantize() if self.fake_quant else DummyQuantize()
+        self.quant_attn = CustomFakeQuantize() if self.fake_quant else DummyQuantize()
+        self.quant_mlpnorm = CustomFakeQuantize() if self.fake_quant else DummyQuantize()
+        self.quant_mlp = CustomFakeQuantize() if self.fake_quant else DummyQuantize()
+        self.quant_residadd = CustomFakeQuantize() if self.fake_quant else DummyQuantize()
 
     def forward(
         self,
@@ -94,8 +190,12 @@ class HGRNBitBlock(nn.Module):
         lower_bound: Optional[torch.Tensor] = False,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        hidden_states = self.quant_input(hidden_states)  # NOTE: quantization
         residual = hidden_states
+
         hidden_states = self.attn_norm(hidden_states)
+        hidden_states = self.quant_postnorm1(hidden_states)  # NOTE: quantization
+
         hidden_states, attentions, past_key_values = self.attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -104,9 +204,16 @@ class HGRNBitBlock(nn.Module):
             output_attentions=output_attentions,
             lower_bound=lower_bound
         )
+        hidden_states = self.quant_attn(hidden_states)  # NOTE: quantization
+
         hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
+        hidden_states = self.quant_mlpnorm(hidden_states)  # NOTE: quantization
+
         hidden_states = self.mlp(hidden_states)
+        hidden_states = self.quant_mlp(hidden_states)  # NOTE: quantization
+
         hidden_states = residual + hidden_states
+        hidden_states = self.quant_residadd(hidden_states)  # NOTE: quantization
 
         outputs = (hidden_states, attentions, past_key_values)
 
