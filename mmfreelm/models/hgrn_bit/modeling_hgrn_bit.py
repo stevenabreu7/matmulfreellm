@@ -25,6 +25,10 @@ from mmfreelm.ops.fusedbitnet import FusedBitLinear as BitLinear
 
 from torch.quantization.observer import MinMaxObserver, MovingAverageMinMaxObserver
 
+
+FAKE_QUANTIZATION = True
+
+
 logger = logging.get_logger(__name__)
 
 
@@ -115,6 +119,39 @@ class DummyQuantize(nn.Module):
         return x
 
 
+class OptionalFakeQuantize(nn.Module):
+    def __init__(self, fake_quant: bool = True, **kwargs):
+        super().__init__()
+        self.fake_quant = fake_quant
+        self.maybe_quant = CustomFakeQuantize(**kwargs) if self.fake_quant else DummyQuantize()
+
+    def forward(self, x):
+        return self.maybe_quant(x)
+    
+    def print_error_summary(self):
+        if self.fake_quant:
+            self.maybe_quant.print_error_summary()
+
+
+class OptionalReLUify(nn.Module):
+    def __init__(self, fake_quant: bool = True, act_fn: str = "swish"):
+        super().__init__()
+        self.fake_quant = fake_quant
+        self.act_fn = ACT2FN[act_fn]
+        self.relu = nn.ReLU()
+        self.mean_error = []
+
+    def forward(self, x):
+        if self.fake_quant:
+            x_old = self.act_fn(x).detach().cpu()
+            x_new = self.relu(x)
+            err_rel = (x_new.detach().cpu() - x_old).abs().mean().item() / x_old.abs().mean().item()
+            self.mean_error.append(err_rel)
+            return x_new
+        else:
+            return self.act_fn(x)
+
+
 class HGRNBitMLP(nn.Module):
 
     def __init__(
@@ -122,7 +159,8 @@ class HGRNBitMLP(nn.Module):
         hidden_size: int,
         hidden_ratio: Optional[int] = None,
         intermediate_size: Optional[int] = None,
-        hidden_act: str = 'swish'
+        hidden_act: str = 'swish',
+        fake_quant: bool = FAKE_QUANTIZATION,
     ) -> HGRNBitMLP:
         super().__init__()
 
@@ -139,9 +177,11 @@ class HGRNBitMLP(nn.Module):
 
         self.gate_proj = BitLinear(self.hidden_size, self.intermediate_size * 2, bias=False)
         self.down_proj = BitLinear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[hidden_act]
+        self.act_fn = OptionalReLUify(fake_quant=fake_quant, act_fn=hidden_act)
 
     def forward(self, x):
+        # NOTE(stevenabreu): we need another fakequant in the swiglu, right?
+        #                    input/output of the MLP is quantized in the HGRNBitBlock
         y = self.gate_proj(x)
         gate, y = y.chunk(2, -1)
         z = self.down_proj(swiglu(gate, y))
@@ -149,11 +189,14 @@ class HGRNBitMLP(nn.Module):
 
 
 class HGRNBitBlock(nn.Module):
-    def __init__(self, config: HGRNBitConfig, layer_idx: int, fake_quant: bool = True):
+    def __init__(self, config: HGRNBitConfig, layer_idx: int, fake_quant: bool = FAKE_QUANTIZATION):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.fake_quant = fake_quant
 
+        self.quant_input = OptionalFakeQuantize(fake_quant)
         self.attn_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
+        self.quant_postnorm1 = OptionalFakeQuantize(fake_quant)
         self.attn = HGRNBitAttention(
             mode=config.attn_mode,
             hidden_size=config.hidden_size,
@@ -165,20 +208,17 @@ class HGRNBitBlock(nn.Module):
             layernorm_eps=config.rms_norm_eps,
             layer_idx=layer_idx
         )
+        self.quant_attn = OptionalFakeQuantize(fake_quant)
         self.mlp_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
+        self.quant_mlpnorm = OptionalFakeQuantize(fake_quant)
         self.mlp = HGRNBitMLP(
             hidden_size=config.hidden_size,
             hidden_ratio=config.hidden_ratio,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act
         )
-        self.fake_quant = fake_quant
-        self.quant_input = CustomFakeQuantize() if self.fake_quant else DummyQuantize()
-        self.quant_postnorm1 = CustomFakeQuantize() if self.fake_quant else DummyQuantize()
-        self.quant_attn = CustomFakeQuantize() if self.fake_quant else DummyQuantize()
-        self.quant_mlpnorm = CustomFakeQuantize() if self.fake_quant else DummyQuantize()
-        self.quant_mlp = CustomFakeQuantize() if self.fake_quant else DummyQuantize()
-        self.quant_residadd = CustomFakeQuantize() if self.fake_quant else DummyQuantize()
+        self.quant_mlp = OptionalFakeQuantize(fake_quant)
+        self.quant_residadd = OptionalFakeQuantize(fake_quant)
 
     def forward(
         self,
@@ -265,16 +305,18 @@ class HGRNBitPreTrainedModel(PreTrainedModel):
 
 class HGRNBitModel(HGRNBitPreTrainedModel):
 
-    def __init__(self, config: HGRNBitConfig):
+    def __init__(self, config: HGRNBitConfig, fake_quant: bool = FAKE_QUANTIZATION):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
+        # NOTE(stevenabreu): for now we will ignore the embedding for quantization
         self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         if config.use_lower_bound:
             self.lower_bounds = nn.Parameter(torch.zeros(config.num_hidden_layers, config.hidden_size))
         self.layers = nn.ModuleList([HGRNBitBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.quant_norm = OptionalFakeQuantize(fake_quant)
 
         self.gradient_checkpointing = False
 
@@ -367,6 +409,7 @@ class HGRNBitModel(HGRNBitPreTrainedModel):
                 all_attns += (attentions,)
 
         hidden_states = self.norm(hidden_states)
+        hidden_states = self.quant_norm(hidden_states)  # NOTE: quantization
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -392,6 +435,7 @@ class HGRNBitForCausalLM(HGRNBitPreTrainedModel):
         super().__init__(config)
         self.model = HGRNBitModel(config)
         self.vocab_size = config.vocab_size
+        # NOTE(stevenabreu): we can ignore the lm_head for quantization (it's bitlinear)
         self.lm_head = BitLinear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
