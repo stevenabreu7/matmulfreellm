@@ -32,9 +32,13 @@ class HGRNBitAttention(nn.Module):
         conv_bias: bool = False,
         share_conv_kernel: bool = True,
         layernorm_eps: float = 1e-5,
-        layer_idx: int = None
+        layer_idx: int = None,
+        quantization_cfg = None,
     ) -> HGRNAttention:
         super().__init__()
+
+        if quantization_cfg.hgrnbitblock_config.attn_config is not None and quantization_cfg.hgrnbitblock_config.attn_config.quant:
+            raise NotImplementedError("Quantization of attention is not supported yet.")
 
         self.mode = mode
         self.hidden_size = hidden_size

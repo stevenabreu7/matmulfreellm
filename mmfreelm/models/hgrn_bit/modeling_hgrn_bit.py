@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import warnings
 from typing import List, Optional, Tuple, Union
+import typing as ty
 
 import torch
 import torch.nn as nn
@@ -22,8 +23,11 @@ from mmfreelm.modules import FusedCrossEntropyLoss, RMSNorm
 from mmfreelm.modules.activations import swiglu_linear, swiglu
 #from mmfreelm.ops.bitnet import BitLinear_Fuse as BitLinear
 from mmfreelm.ops.fusedbitnet import FusedBitLinear as BitLinear
+from mmfreelm.ops.fusedbitnet import BitLinear as UnfusedBitLinear
+
 
 from torch.quantization.observer import MinMaxObserver, MovingAverageMinMaxObserver
+from dataclasses import dataclass
 
 
 FAKE_QUANTIZATION = True
@@ -32,17 +36,91 @@ FAKE_QUANTIZATION = True
 logger = logging.get_logger(__name__)
 
 
+@dataclass
+class HGRNBitAttentionQuantizationConfig:
+    quant: bool = False
+
+    def __post_init__(self):
+        if self.quant:
+            raise NotImplementedError("Quantization of MLP is not supported yet.")
+
+
+@dataclass
+class HGRNBitMLPQuantizationConfig:
+    quant: bool = False
+
+    def __post_init__(self):
+        if self.quant:
+            raise NotImplementedError("Quantization of MLP is not supported yet.")
+
+
+@dataclass
+class HGRNBitBlockQuantizationConfig:
+    quant_input: ty.Optional[int] = 8
+    quant_postnorm1: ty.Optional[int] = 8
+    quant_attn: ty.Optional[int] = 8
+    quant_mlpnorm: ty.Optional[int] = 8
+    quant_mlp: ty.Optional[int] = 8
+    quant_residadd: ty.Optional[int] = 8
+    attn_config: ty.Optional[HGRNBitAttentionQuantizationConfig] = HGRNBitAttentionQuantizationConfig()
+    mlp_config: ty.Optional[HGRNBitMLPQuantizationConfig] = HGRNBitMLPQuantizationConfig()
+
+
+@dataclass
+class QuantizationConfig:
+    hgrnbitblock_config: ty.Optional[HGRNBitBlockQuantizationConfig] = HGRNBitBlockQuantizationConfig()
+    quant_norm: ty.Optional[int] = 8
+    quant_embedding: ty.Optional[int] = None
+    quant_lm_head: ty.Optional[int] = None
+    log_local_quant_errors: bool = False
+    unfused_bitlinear: bool = False
+
+    def __post_init__(self):
+        if self.quant_embedding is not None:
+            raise NotImplementedError("Quantization of embedding is not supported yet.")
+        if self.quant_lm_head is not None:
+            raise NotImplementedError("Quantization of LM head is not supported yet.")
+    
+    @staticmethod
+    def NoneConfig():
+        return QuantizationConfig(
+            hgrnbitblock_config = HGRNBitBlockQuantizationConfig(
+                quant_input=None,
+                quant_postnorm1=None,
+                quant_attn=None,
+                quant_mlpnorm=None,
+                quant_mlp=None,
+                quant_residadd=None,
+                attn_config=HGRNBitAttentionQuantizationConfig(
+                    quant=False
+                ),
+                mlp_config=HGRNBitMLPQuantizationConfig(
+                    quant=False
+                )
+            ),
+            quant_norm=None,
+            quant_embedding=None,
+            quant_lm_head=None,
+            log_local_quant_errors=False,
+            unfused_bitlinear=False,
+        )
+
+
 class CustomFakeQuantize(nn.Module):
     def __init__(self, 
-                 quant_min=-128, 
-                 quant_max=127, 
-                 dtype=torch.qint8, 
+                 precision=8,
                  qscheme=torch.per_tensor_symmetric, 
-                 observer=MinMaxObserver):
+                 observer=MinMaxObserver,
+                 log_error=True,
+        ):
         super().__init__()
-        self.quant_min = quant_min
-        self.quant_max = quant_max
-        self.dtype = dtype
+
+        assert precision <= 32, "precision must be <= 32"
+
+        self.precision = precision
+        self.quant_min = -(2**(precision - 1))
+        self.quant_max = 2**(precision - 1) - 1
+        self.dtype = torch.qint8 if precision <= 8 else torch.qint32
         self.qscheme = qscheme
 
         # Initialize the observer
@@ -51,7 +129,16 @@ class CustomFakeQuantize(nn.Module):
         self.zero_point = None
 
         # debugging information
-        self.mean_error = []
+        self.log_error = log_error
+        if log_error:
+            self.n_errors = 0
+            self.sum_error = 0.0
+            self.min_error = float('inf')
+            self.max_error = 0.0
+            self.mean_error = 0.0
+            self.mean_error = 0
+            self.m2 = 0  # helper for std
+            # self.mean_error = []
 
     def forward(self, x):
         # Ensure the input is float32
@@ -70,16 +157,33 @@ class CustomFakeQuantize(nn.Module):
         x = self.quantize_dequantize(x)
 
         # Compute quantization errors and log them
-        err_abs = (x.detach().cpu() - x_pre).abs().mean().item()
-        err_rel = err_abs / x_pre.abs().mean().item()
-        self.mean_error.append(err_rel)
+        if self.log_error:
+            err_abs = (x.detach().cpu() - x_pre).abs().mean().item()
+            err_rel = err_abs / x_pre.abs().mean().item()
+            self.sum_error += err_rel
+            self.n_errors += 1
+            self.min_error = min(self.min_error, err_rel)
+            self.max_error = max(self.max_error, err_rel)
+            # std
+            delta = err_rel - self.mean_error
+            self.mean_error += delta / self.n_errors
+            delta2 = err_rel - self.mean_error
+            self.m2 += delta * delta2
 
         return x.to(dtype=xdtype)
     
     def print_error_summary(self):
-        mean_error = torch.tensor(self.mean_error)
-        print(f"   Relative error: {mean_error.mean().item():6.2%} +/- {mean_error.std().item():6.2%}", end=" ")
-        print(f"(min: {mean_error.min().item():6.2%}, max: {mean_error.max().item():6.2%})")
+        if self.log_error:
+            std = float('nan')
+            if self.n_errors > 2:
+                std = math.sqrt(self.m2 / (self.n_errors - 1))
+            print(f"   Relative error: {self.sum_error / self.n_errors:6.2%} +- {std:6.2%}", end=" ")	
+            print(f"(min: {self.min_error:6.2%}, max: {self.max_error:6.2%})")
+            # mean_error = torch.tensor(self.mean_error)
+            # print(f"   Relative error: {mean_error.mean().item():6.2%} +/- {mean_error.std().item():6.2%}", end=" ")
+            # print(f"(min: {mean_error.min().item():6.2%}, max: {mean_error.max().item():6.2%})")
+        else:
+            print("log_error is turned off, cannot print error summary")
 
     def calculate_qparams(self):
         # Obtain min and max from the observer
@@ -120,16 +224,16 @@ class DummyQuantize(nn.Module):
 
 
 class OptionalFakeQuantize(nn.Module):
-    def __init__(self, fake_quant: bool = True, **kwargs):
+    def __init__(self, precision: Optional[int] = None, **kwargs):
         super().__init__()
-        self.fake_quant = fake_quant
-        self.maybe_quant = CustomFakeQuantize(**kwargs) if self.fake_quant else DummyQuantize()
+        self.precision = precision
+        self.maybe_quant = CustomFakeQuantize(**kwargs) if self.precision is not None else DummyQuantize()
 
     def forward(self, x):
         return self.maybe_quant(x)
     
     def print_error_summary(self):
-        if self.fake_quant:
+        if self.precision is not None:
             self.maybe_quant.print_error_summary()
 
 
@@ -158,11 +262,15 @@ class HGRNBitMLP(nn.Module):
         self,
         hidden_size: int,
         hidden_ratio: Optional[int] = None,
-        intermediate_size: Optional[int] = None,
         hidden_act: str = 'swish',
-        fake_quant: bool = FAKE_QUANTIZATION,
+        intermediate_size: Optional[int] = None,
+        quantization_cfg = None,
     ) -> HGRNBitMLP:
         super().__init__()
+
+        if quantization_cfg.hgrnbitblock_config.mlp_config is not None and quantization_cfg.hgrnbitblock_config.mlp_config.quant:
+            # TODO: activation quantization & relufication
+            raise NotImplementedError("Quantization of MLP is not supported yet.")
 
         self.hidden_size = hidden_size
         # the final number of params is `hidden_ratio * hidden_size^2`
@@ -175,11 +283,16 @@ class HGRNBitMLP(nn.Module):
         self.hidden_ratio = hidden_ratio
         self.intermediate_size = intermediate_size
 
+        if quantization_cfg.unfused_bitlinear:
+            BitLinear = UnfusedBitLinear
+        print(BitLinear)
+
         self.gate_proj = BitLinear(self.hidden_size, self.intermediate_size * 2, bias=False)
         self.down_proj = BitLinear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = OptionalReLUify(fake_quant=fake_quant, act_fn=hidden_act)
+        # self.act_fn = OptionalReLUify(fake_quant=fake_quant, act_fn=hidden_act)
 
     def forward(self, x):
+        # TODO: quantize the swiglu / replace with native pytorch code
         # NOTE(stevenabreu): we need another fakequant in the swiglu, right?
         #                    input/output of the MLP is quantized in the HGRNBitBlock
         y = self.gate_proj(x)
@@ -189,14 +302,15 @@ class HGRNBitMLP(nn.Module):
 
 
 class HGRNBitBlock(nn.Module):
-    def __init__(self, config: HGRNBitConfig, layer_idx: int, fake_quant: bool = FAKE_QUANTIZATION):
+    def __init__(self, config: HGRNBitConfig, layer_idx: int, quantization_cfg = None):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.fake_quant = fake_quant
 
-        self.quant_input = OptionalFakeQuantize(fake_quant)
+        log_err = quantization_cfg.log_local_quant_errors
+        qconfig = quantization_cfg.hgrnbitblock_config
+        self.quant_input = OptionalFakeQuantize(qconfig.quant_input, log_error=log_err)
         self.attn_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
-        self.quant_postnorm1 = OptionalFakeQuantize(fake_quant)
+        self.quant_postnorm1 = OptionalFakeQuantize(qconfig.quant_postnorm1, log_error=log_err)
         self.attn = HGRNBitAttention(
             mode=config.attn_mode,
             hidden_size=config.hidden_size,
@@ -206,19 +320,21 @@ class HGRNBitBlock(nn.Module):
             conv_size=config.conv_size,
             share_conv_kernel=config.share_conv_kernel,
             layernorm_eps=config.rms_norm_eps,
-            layer_idx=layer_idx
+            layer_idx=layer_idx,
+            quantization_cfg=quantization_cfg,
         )
-        self.quant_attn = OptionalFakeQuantize(fake_quant)
+        self.quant_attn = OptionalFakeQuantize(qconfig.quant_attn, log_error=log_err)
         self.mlp_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
-        self.quant_mlpnorm = OptionalFakeQuantize(fake_quant)
+        self.quant_mlpnorm = OptionalFakeQuantize(qconfig.quant_mlpnorm, log_error=log_err)
         self.mlp = HGRNBitMLP(
             hidden_size=config.hidden_size,
             hidden_ratio=config.hidden_ratio,
             intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act
+            hidden_act=config.hidden_act,
+            quantization_cfg=quantization_cfg,
         )
-        self.quant_mlp = OptionalFakeQuantize(fake_quant)
-        self.quant_residadd = OptionalFakeQuantize(fake_quant)
+        self.quant_mlp = OptionalFakeQuantize(qconfig.quant_mlp, log_error=log_err)
+        self.quant_residadd = OptionalFakeQuantize(qconfig.quant_residadd, log_error=log_err)
 
     def forward(
         self,
@@ -305,18 +421,24 @@ class HGRNBitPreTrainedModel(PreTrainedModel):
 
 class HGRNBitModel(HGRNBitPreTrainedModel):
 
-    def __init__(self, config: HGRNBitConfig, fake_quant: bool = FAKE_QUANTIZATION):
+    def __init__(self, config: HGRNBitConfig, quantization_cfg=None): 
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         # NOTE(stevenabreu): for now we will ignore the embedding for quantization
         self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        assert quantization_cfg.quant_embedding is None, "Quantization of embedding is not supported yet."
+
         if config.use_lower_bound:
             self.lower_bounds = nn.Parameter(torch.zeros(config.num_hidden_layers, config.hidden_size))
-        self.layers = nn.ModuleList([HGRNBitBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([
+            HGRNBitBlock(config, layer_idx, quantization_cfg=quantization_cfg) 
+            for layer_idx in range(config.num_hidden_layers)
+        ])
+
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.quant_norm = OptionalFakeQuantize(fake_quant)
+        self.quant_norm = OptionalFakeQuantize(precision=quantization_cfg.quant_norm, log_error=quantization_cfg.log_local_quant_errors)
 
         self.gradient_checkpointing = False
 
@@ -431,11 +553,20 @@ class HGRNBitModel(HGRNBitPreTrainedModel):
 class HGRNBitForCausalLM(HGRNBitPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config):
+    def __init__(self, config, quantization_cfg=None):
         super().__init__(config)
-        self.model = HGRNBitModel(config)
+
+        if quantization_cfg is None:
+            quantization_cfg = QuantizationConfig.NoneConfig()
+        
+        if quantization_cfg.unfused_bitlinear:
+            BitLinear = UnfusedBitLinear
+        print(BitLinear)
+
+        self.model = HGRNBitModel(config, quantization_cfg=quantization_cfg)
         self.vocab_size = config.vocab_size
         # NOTE(stevenabreu): we can ignore the lm_head for quantization (it's bitlinear)
+        assert quantization_cfg.quant_lm_head is None, "Quantization of LM head is not supported yet."
         self.lm_head = BitLinear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
