@@ -14,6 +14,7 @@ from transformers.cache_utils import Cache
 from mmfreelm.modules import FusedRMSNormSwishGate, ShortConvolution
 from mmfreelm.modules.activations import swiglu
 from mmfreelm.ops.hgrn.recurrent_fuse import fused_recurrent_hgrn
+from mmfreelm.ops.hgrn.naive import naive_recurrent_hgrn
 
 #from mmfreelm.ops.bitnet import BitLinear_Fuse as BitLinear
 from mmfreelm.ops.fusedbitnet import FusedBitLinear as BitLinear
@@ -37,8 +38,12 @@ class HGRNBitAttention(nn.Module):
     ) -> HGRNAttention:
         super().__init__()
 
+        self.use_unfused_recurrent = False
         if quantization_cfg.hgrnbitblock_config.attn_config is not None and quantization_cfg.hgrnbitblock_config.attn_config.quant:
-            raise NotImplementedError("Quantization of attention is not supported yet.")
+            self.use_unfused_recurrent = True
+            print("IMPORTANT: using unfused recurrent")
+            # TODO: implement the other quant config stuff
+            # raise NotImplementedError("Quantization of attention is not supported yet.")
 
         self.mode = mode
         self.hidden_size = hidden_size
@@ -60,6 +65,8 @@ class HGRNBitAttention(nn.Module):
         self.i_proj = BitLinear(hidden_size, self.input_dim, bias=False)
         self.f_proj = BitLinear(hidden_size, self.input_dim, bias=False)
         self.g_proj = BitLinear(hidden_size, self.input_dim, bias=False)
+
+        assert not use_short_conv, "using short convolution"
 
         if use_short_conv:
             self.conv_size = conv_size
@@ -125,8 +132,11 @@ class HGRNBitAttention(nn.Module):
         i, f = map(lambda x: rearrange(x, 'b l (h d) -> b h l d', h=self.num_heads), (i, f))
 
         recurrent_state = last_state[-1] if use_cache else None
-        if mode == 'fused_recurrent':
+        if mode == 'fused_recurrent' and not self.use_unfused_recurrent:
             o, recurrent_state = fused_recurrent_hgrn(i, f, initial_state=recurrent_state, output_final_state=use_cache)
+        elif self.use_unfused_recurrent:
+            print("IMPORTANT: using unfused recurrent")
+            o, recurrent_state = naive_recurrent_hgrn(i, f, initial_state=recurrent_state, output_final_state=use_cache)
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
 

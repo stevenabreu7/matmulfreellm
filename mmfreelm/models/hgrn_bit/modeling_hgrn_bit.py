@@ -22,15 +22,13 @@ from mmfreelm.models.utils import RecurrentCache
 from mmfreelm.modules import FusedCrossEntropyLoss, RMSNorm
 from mmfreelm.modules.activations import swiglu_linear, swiglu
 #from mmfreelm.ops.bitnet import BitLinear_Fuse as BitLinear
-from mmfreelm.ops.fusedbitnet import FusedBitLinear as BitLinear
+from mmfreelm.ops.fusedbitnet import FusedBitLinear as FusedBitLinear
 from mmfreelm.ops.fusedbitnet import BitLinear as UnfusedBitLinear
 
 
 from torch.quantization.observer import MinMaxObserver, MovingAverageMinMaxObserver
 from dataclasses import dataclass
-
-
-FAKE_QUANTIZATION = True
+from functools import partial
 
 
 logger = logging.get_logger(__name__)
@@ -40,9 +38,9 @@ logger = logging.get_logger(__name__)
 class HGRNBitAttentionQuantizationConfig:
     quant: bool = False
 
-    def __post_init__(self):
-        if self.quant:
-            raise NotImplementedError("Quantization of MLP is not supported yet.")
+    # def __post_init__(self):
+    #     if self.quant:
+    #         raise NotImplementedError("Quantization of attention is not supported yet.")
 
 
 @dataclass
@@ -74,6 +72,7 @@ class QuantizationConfig:
     quant_lm_head: ty.Optional[int] = None
     log_local_quant_errors: bool = False
     unfused_bitlinear: bool = False
+    naive_rmsnorm: bool = False
 
     def __post_init__(self):
         if self.quant_embedding is not None:
@@ -103,6 +102,7 @@ class QuantizationConfig:
             quant_lm_head=None,
             log_local_quant_errors=False,
             unfused_bitlinear=False,
+            naive_rmsnorm=False,
         )
 
 
@@ -284,10 +284,13 @@ class HGRNBitMLP(nn.Module):
         self.intermediate_size = intermediate_size
 
         if quantization_cfg.unfused_bitlinear:
+            BitLinear = partial(UnfusedBitLinear, use_naive_norm=quantization_cfg.naive_rmsnorm)
             BitLinear = UnfusedBitLinear
+        else:
+            BitLinear = FusedBitLinear
         print(BitLinear)
 
-        self.gate_proj = BitLinear(self.hidden_size, self.intermediate_size * 2, bias=False)
+        self.gate_proj = BitLinear(self.hidden_size, self.intermediate_size * 2, bias=False, )
         self.down_proj = BitLinear(self.intermediate_size, self.hidden_size, bias=False)
         # self.act_fn = OptionalReLUify(fake_quant=fake_quant, act_fn=hidden_act)
 
@@ -391,7 +394,7 @@ class HGRNBitPreTrainedModel(PreTrainedModel):
         rescale_prenorm_residual: bool = True,
         num_residuals_per_layer: int = 2,
     ):
-        if isinstance(module, (nn.Linear, nn.Conv1d, BitLinear)):
+        if isinstance(module, (nn.Linear, nn.Conv1d, FusedBitLinear, UnfusedBitLinear)):
             # Slightly different from the TF version which uses truncated_normal for initialization
             # cf https://github.com/pytorch/pytorch/pull/5617
             nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
@@ -560,7 +563,10 @@ class HGRNBitForCausalLM(HGRNBitPreTrainedModel):
             quantization_cfg = QuantizationConfig.NoneConfig()
         
         if quantization_cfg.unfused_bitlinear:
+            BitLinear = partial(UnfusedBitLinear, use_naive_norm=quantization_cfg.naive_rmsnorm)
             BitLinear = UnfusedBitLinear
+        else:
+            BitLinear = FusedBitLinear
         print(BitLinear)
 
         self.model = HGRNBitModel(config, quantization_cfg=quantization_cfg)

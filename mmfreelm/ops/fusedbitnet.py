@@ -536,13 +536,57 @@ def layer_norm_linear_quant_fn(
     )
 
 
+class RMSNormNaive(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6, elementwise_affine=True, bias=False):
+        """
+        Initializes the RMSNorm layer.
+
+        Args:
+            hidden_size (int): The size of the last dimension of the input tensor.
+            eps (float, optional): Small epsilon value to avoid division by zero. Defaults to 1e-6.
+            elementwise_affine (bool, optional): Whether to include learnable affine parameters. Defaults to True.
+        """
+        super(RMSNormNaive, self).__init__()
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        self.use_bias = bias
+
+        if self.elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(hidden_size))
+            if bias:
+                self.bias = nn.Parameter(torch.zeros(hidden_size))
+        else:
+            self.register_parameter('weight', None)
+            self.register_parameter('bias', None)
+
+    def forward(self, x, residual=None):
+        # Add residual if provided
+        if residual is not None:
+            x = x + residual
+
+        # Compute RMS
+        rms = x.pow(2).mean(dim=-1, keepdim=True).sqrt()
+
+        # Normalize
+        x_norm = x / (rms + self.eps)
+
+        # Apply weight and bias if they exist
+        if self.elementwise_affine:
+            x_norm = x_norm * self.weight
+            if self.use_bias:
+                x_norm = x_norm + self.bias
+
+        return x_norm
+
+
 class BitLinear(nn.Linear):
     """
     A custom linear layer that applies quantization on both activations and weights.
     This is primarily for training; kernel optimization is needed for efficiency in deployment.
     """
 
-    def __init__(self, in_features, out_features, bias=False):
+    def __init__(self, in_features, out_features, bias=False, use_naive_norm=False):
         """
         Initializes the BitLinear layer.
 
@@ -553,7 +597,10 @@ class BitLinear(nn.Linear):
         """
         # Initialize the superclass nn.Linear with the given parameters
         super(BitLinear, self).__init__(in_features, out_features, bias=bias)
-        self.norm = RMSNorm(in_features, eps=1e-8)
+        if use_naive_norm:
+            self.norm = RMSNormNaive(in_features, eps=1e-8)
+        else:
+            self.norm = RMSNorm(in_features, eps=1e-8)
 
     def forward(self, x):
         """
