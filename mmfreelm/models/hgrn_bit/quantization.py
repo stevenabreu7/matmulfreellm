@@ -229,3 +229,34 @@ def swiglu_naive(x, y):
     # silu_x = x * torch.sigmoid(x)
     # return silu_x * y
     return x * torch.sigmoid(x) * y
+
+
+class FusedRMSNormSwishGateNaive(nn.Module):
+    def __init__(self, hidden_size, eps=1e-5, quant=None, log_error=False):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.bias = None  # No bias in this implementation
+        self.quant_gnorm = OptionalFakeQuantize(quant, log_error=log_error)
+        self.quant_swish = OptionalFakeQuantize(quant, log_error=log_error)
+
+    def rms_norm(self, x):
+        # Root mean square normalization
+        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+        return x / rms * self.weight
+
+    def swish_gate(self, o):
+        # Swish gate: o * sigmoid(o)
+        return o * torch.sigmoid(o)
+
+    def forward(self, x, o, residual=None):
+        if residual is not None:
+            x = x + residual
+        # Apply RMS normalization to x
+        x_norm = self.rms_norm(x)
+        x_norm = self.quant_gnorm(x_norm)  # NOTE: quantization
+        # Apply Swish gate to o
+        gated_o = self.swish_gate(o)
+        gated_o = self.quant_swish(gated_o)  # NOTE: quantization
+        # Modulate normalized x with the gated o
+        return x_norm * gated_o
