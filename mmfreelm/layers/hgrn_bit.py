@@ -20,6 +20,33 @@ from mmfreelm.ops.hgrn.naive import naive_recurrent_hgrn
 from mmfreelm.ops.fusedbitnet import FusedBitLinear as BitLinear
 
 
+class FusedRMSNormSwishGateNaive(nn.Module):
+    def __init__(self, hidden_size, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.bias = None  # No bias in this implementation
+
+    def rms_norm(self, x):
+        # Root mean square normalization
+        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+        return x / rms * self.weight
+
+    def swish_gate(self, o):
+        # Swish gate: o * sigmoid(o)
+        return o * torch.sigmoid(o)
+
+    def forward(self, x, o, residual=None):
+        if residual is not None:
+            x = x + residual
+        # Apply RMS normalization to x
+        x_norm = self.rms_norm(x)
+        # Apply Swish gate to o
+        gated_o = self.swish_gate(o)
+        # Modulate normalized x with the gated o
+        return x_norm * gated_o
+
+
 class HGRNBitAttention(nn.Module):
 
     def __init__(
@@ -44,6 +71,8 @@ class HGRNBitAttention(nn.Module):
             print("IMPORTANT: using unfused recurrent")
             # TODO: implement the other quant config stuff
             # raise NotImplementedError("Quantization of attention is not supported yet.")
+
+        self.naive_rmsnormswish = quantization_cfg.hgrnbitblock_config.attn_config.naive_rmsnormswish
 
         self.mode = mode
         self.hidden_size = hidden_size
@@ -77,7 +106,10 @@ class HGRNBitAttention(nn.Module):
                 self.f_conv1d = ShortConvolution(self.input_dim, conv_size, activation='silu')
                 self.i_conv1d = ShortConvolution(self.input_dim, conv_size, activation='silu')
 
-        self.g_norm = FusedRMSNormSwishGate(self.input_dim, layernorm_eps)
+        if self.naive_rmsnormswish:
+            self.g_norm = FusedRMSNormSwishGateNaive(self.input_dim, eps=layernorm_eps)
+        else:
+            self.g_norm = FusedRMSNormSwishGate(self.input_dim, layernorm_eps)
         self.o_proj = BitLinear(self.input_dim, hidden_size, bias=False)
 
         self.apply(self._initialize_weights)
@@ -135,7 +167,6 @@ class HGRNBitAttention(nn.Module):
         if mode == 'fused_recurrent' and not self.use_unfused_recurrent:
             o, recurrent_state = fused_recurrent_hgrn(i, f, initial_state=recurrent_state, output_final_state=use_cache)
         elif self.use_unfused_recurrent:
-            print("IMPORTANT: using unfused recurrent")
             o, recurrent_state = naive_recurrent_hgrn(i, f, initial_state=recurrent_state, output_final_state=use_cache)
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")

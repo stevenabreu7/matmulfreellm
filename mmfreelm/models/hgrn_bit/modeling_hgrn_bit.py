@@ -37,19 +37,14 @@ logger = logging.get_logger(__name__)
 @dataclass
 class HGRNBitAttentionQuantizationConfig:
     quant: bool = False
-
-    # def __post_init__(self):
-    #     if self.quant:
-    #         raise NotImplementedError("Quantization of attention is not supported yet.")
+    unfused_recurrent: bool = False
+    naive_rmsnormswish: bool = False
 
 
 @dataclass
 class HGRNBitMLPQuantizationConfig:
     quant: bool = False
-
-    def __post_init__(self):
-        if self.quant:
-            raise NotImplementedError("Quantization of MLP is not supported yet.")
+    naive_swiglu: bool = False
 
 
 @dataclass
@@ -74,12 +69,6 @@ class QuantizationConfig:
     unfused_bitlinear: bool = False
     naive_rmsnorm: bool = False
 
-    def __post_init__(self):
-        if self.quant_embedding is not None:
-            raise NotImplementedError("Quantization of embedding is not supported yet.")
-        if self.quant_lm_head is not None:
-            raise NotImplementedError("Quantization of LM head is not supported yet.")
-    
     @staticmethod
     def NoneConfig():
         return QuantizationConfig(
@@ -91,10 +80,13 @@ class QuantizationConfig:
                 quant_mlp=None,
                 quant_residadd=None,
                 attn_config=HGRNBitAttentionQuantizationConfig(
-                    quant=False
+                    quant=False,
+                    unfused_recurrent=False,
+                    naive_rmsnormswish=False,
                 ),
                 mlp_config=HGRNBitMLPQuantizationConfig(
-                    quant=False
+                    quant=False,
+                    naive_swiglu=False,
                 )
             ),
             quant_norm=None,
@@ -256,6 +248,13 @@ class OptionalReLUify(nn.Module):
             return self.act_fn(x)
 
 
+def swiglu_naive(x, y):
+    # silu_x = x / (1 + torch.exp(-x))
+    # silu_x = x * torch.sigmoid(x)
+    # return silu_x * y
+    return x * torch.sigmoid(x) * y
+
+
 class HGRNBitMLP(nn.Module):
 
     def __init__(
@@ -271,6 +270,8 @@ class HGRNBitMLP(nn.Module):
         if quantization_cfg.hgrnbitblock_config.mlp_config is not None and quantization_cfg.hgrnbitblock_config.mlp_config.quant:
             # TODO: activation quantization & relufication
             raise NotImplementedError("Quantization of MLP is not supported yet.")
+        
+        self.naive_swiglu = quantization_cfg.hgrnbitblock_config.mlp_config.naive_swiglu
 
         self.hidden_size = hidden_size
         # the final number of params is `hidden_ratio * hidden_size^2`
@@ -295,12 +296,15 @@ class HGRNBitMLP(nn.Module):
         # self.act_fn = OptionalReLUify(fake_quant=fake_quant, act_fn=hidden_act)
 
     def forward(self, x):
-        # TODO: quantize the swiglu / replace with native pytorch code
         # NOTE(stevenabreu): we need another fakequant in the swiglu, right?
         #                    input/output of the MLP is quantized in the HGRNBitBlock
         y = self.gate_proj(x)
         gate, y = y.chunk(2, -1)
-        z = self.down_proj(swiglu(gate, y))
+        if self.naive_swiglu:
+            swiglu_out = swiglu_naive(gate, y)
+        else:
+            swiglu_out = swiglu(gate, y)
+        z = self.down_proj(swiglu_out)
         return z
 
 
