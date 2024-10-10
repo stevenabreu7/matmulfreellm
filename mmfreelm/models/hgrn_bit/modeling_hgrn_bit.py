@@ -39,6 +39,7 @@ class HGRNBitAttentionQuantizationConfig:
     quant: bool = False
     unfused_recurrent: bool = False
     naive_rmsnormswish: bool = False
+    naive_swiglu: bool = False
 
 
 @dataclass
@@ -80,12 +81,13 @@ class QuantizationConfig:
                 quant_mlp=None,
                 quant_residadd=None,
                 attn_config=HGRNBitAttentionQuantizationConfig(
-                    quant=False,
+                    quant=None,
                     unfused_recurrent=False,
                     naive_rmsnormswish=False,
+                    naive_swiglu=False,
                 ),
                 mlp_config=HGRNBitMLPQuantizationConfig(
-                    quant=False,
+                    quant=None,
                     naive_swiglu=False,
                 )
             ),
@@ -267,10 +269,9 @@ class HGRNBitMLP(nn.Module):
     ) -> HGRNBitMLP:
         super().__init__()
 
-        if quantization_cfg.hgrnbitblock_config.mlp_config is not None and quantization_cfg.hgrnbitblock_config.mlp_config.quant:
-            # TODO: activation quantization & relufication
-            raise NotImplementedError("Quantization of MLP is not supported yet.")
-        
+        # setup for quantization & naive activation function
+        log_err = quantization_cfg.log_local_quant_errors
+        quant = quantization_cfg.hgrnbitblock_config.mlp_config.quant
         self.naive_swiglu = quantization_cfg.hgrnbitblock_config.mlp_config.naive_swiglu
 
         self.hidden_size = hidden_size
@@ -289,21 +290,22 @@ class HGRNBitMLP(nn.Module):
             BitLinear = UnfusedBitLinear
         else:
             BitLinear = FusedBitLinear
-        print(BitLinear)
 
         self.gate_proj = BitLinear(self.hidden_size, self.intermediate_size * 2, bias=False, )
+        self.quant_gate = OptionalFakeQuantize(quant, log_error=log_err)
+        self.quant_swiglu = OptionalFakeQuantize(quant, log_error=log_err)
         self.down_proj = BitLinear(self.intermediate_size, self.hidden_size, bias=False)
         # self.act_fn = OptionalReLUify(fake_quant=fake_quant, act_fn=hidden_act)
 
     def forward(self, x):
-        # NOTE(stevenabreu): we need another fakequant in the swiglu, right?
-        #                    input/output of the MLP is quantized in the HGRNBitBlock
         y = self.gate_proj(x)
+        y = self.quant_gate(y)
         gate, y = y.chunk(2, -1)
         if self.naive_swiglu:
             swiglu_out = swiglu_naive(gate, y)
         else:
             swiglu_out = swiglu(gate, y)
+        swiglu_out = self.quant_swiglu(swiglu_out)
         z = self.down_proj(swiglu_out)
         return z
 
