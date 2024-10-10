@@ -15,7 +15,7 @@ from mmfreelm.modules import FusedRMSNormSwishGate, ShortConvolution
 from mmfreelm.modules.activations import swiglu
 from mmfreelm.ops.hgrn.recurrent_fuse import fused_recurrent_hgrn
 from mmfreelm.ops.hgrn.naive import naive_recurrent_hgrn
-from mmfreelm.models.hgrn_bit.modeling_hgrn_bit import OptionalFakeQuantize, swiglu_naive
+from mmfreelm.models.hgrn_bit.quantization import OptionalFakeQuantize, swiglu_naive
 
 #from mmfreelm.ops.bitnet import BitLinear_Fuse as BitLinear
 from mmfreelm.ops.fusedbitnet import FusedBitLinear as BitLinear
