@@ -63,8 +63,10 @@ class HGRNBitAttention(nn.Module):
         self.naive_swiglu = quantization_cfg.hgrnbitblock_config.attn_config.naive_swiglu
 
         # activation quantization
+        pow2scale = quantization_cfg.act_quant_pow2scale
         log_err = quantization_cfg.log_local_quant_errors
         quant = quantization_cfg.hgrnbitblock_config.attn_config.quant
+        quant_rec_ht = quantization_cfg.hgrnbitblock_config.attn_config.quant_rec_ht
         # self.quant_it = OptionalFakeQuantize(quant, log_error=log_err)  # NOTE: c in paper -> i in code
 
         self.mode = mode
@@ -90,11 +92,13 @@ class HGRNBitAttention(nn.Module):
             BitLinear = FusedBitLinear
 
         self.f_proj = BitLinear(hidden_size, self.input_dim, bias=False)
-        self.quant_ft = OptionalFakeQuantize(quant, log_error=log_err)
+        self.quant_ft = OptionalFakeQuantize(quant, log_error=log_err, pow2scale=pow2scale)
 
         self.i_proj = BitLinear(hidden_size, self.input_dim, bias=False)
-        self.quant_swiglu = OptionalFakeQuantize(quant, log_error=log_err)
-        self.quant_ht = OptionalFakeQuantize(quant, log_error=log_err)
+        self.quant_swiglu = OptionalFakeQuantize(quant, log_error=log_err, pow2scale=pow2scale)
+        self.do_quant_rec_ht = quant_rec_ht is not None
+        self.quant_rec_ht = OptionalFakeQuantize(quant_rec_ht, log_error=log_err, pow2scale=pow2scale)
+        self.quant_ht = OptionalFakeQuantize(quant, log_error=log_err, pow2scale=pow2scale)
 
         assert not use_short_conv, "using short convolution"
 
@@ -182,7 +186,29 @@ class HGRNBitAttention(nn.Module):
         if mode == 'fused_recurrent' and not self.use_unfused_recurrent:
             o, recurrent_state = fused_recurrent_hgrn(i, f, initial_state=recurrent_state, output_final_state=use_cache)
         elif self.use_unfused_recurrent:
-            o, recurrent_state = naive_recurrent_hgrn(i, f, initial_state=recurrent_state, output_final_state=use_cache)
+            if self.do_quant_rec_ht:
+                dtype = i.dtype
+                i = i.float()
+                f = f.float()
+                B, H, T, D = i.shape
+                h = torch.zeros(B, H, D, dtype=torch.float, device=i.device)
+                o = torch.zeros_like(i)
+                final_state = None
+                if recurrent_state is not None:
+                    h += recurrent_state.detach()
+                for t in range(T):
+                    h = f[:, :, t] * h + i[:, :, t]
+                    h = self.quant_rec_ht(h)  # NOTE: quantization
+                    o[:, :, t] = h
+                if use_cache:
+                    final_state = h
+                o = o.to(dtype)
+                recurrent_state = final_state
+                del h
+                del final_state
+                del dtype
+            else:
+                o, recurrent_state = naive_recurrent_hgrn(i, f, initial_state=recurrent_state, output_final_state=use_cache)
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
         o = self.quant_ht(o)  # NOTE: quantization
@@ -236,6 +262,7 @@ class HGRNBitMLP(nn.Module):
         super().__init__()
 
         # setup for quantization & naive activation function
+        pow2scale = quantization_cfg.act_quant_pow2scale
         log_err = quantization_cfg.log_local_quant_errors
         quant = quantization_cfg.hgrnbitblock_config.mlp_config.quant
         self.naive_swiglu = quantization_cfg.hgrnbitblock_config.mlp_config.naive_swiglu
@@ -257,8 +284,8 @@ class HGRNBitMLP(nn.Module):
             BitLinear = FusedBitLinear
 
         self.gate_proj = BitLinear(self.hidden_size, self.intermediate_size * 2, bias=False, )
-        self.quant_gate = OptionalFakeQuantize(quant, log_error=log_err)
-        self.quant_swiglu = OptionalFakeQuantize(quant, log_error=log_err)
+        self.quant_gate = OptionalFakeQuantize(quant, log_error=log_err, pow2scale=pow2scale)
+        self.quant_swiglu = OptionalFakeQuantize(quant, log_error=log_err, pow2scale=pow2scale)
         self.down_proj = BitLinear(self.intermediate_size, self.hidden_size, bias=False)
         # self.act_fn = OptionalReLUify(fake_quant=fake_quant, act_fn=hidden_act)
 
@@ -280,11 +307,13 @@ class HGRNBitBlock(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
 
+        self.remove_double_rmsnorms = quantization_cfg.hgrnbitblock_config.remove_double_rmsnorms
+        pow2scale = quantization_cfg.act_quant_pow2scale
         log_err = quantization_cfg.log_local_quant_errors
         qconfig = quantization_cfg.hgrnbitblock_config
-        self.quant_input = OptionalFakeQuantize(qconfig.quant_input, log_error=log_err)
+        self.quant_input = OptionalFakeQuantize(qconfig.quant_input, log_error=log_err, pow2scale=pow2scale)
         self.attn_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
-        self.quant_postnorm1 = OptionalFakeQuantize(qconfig.quant_postnorm1, log_error=log_err)
+        self.quant_postnorm1 = OptionalFakeQuantize(qconfig.quant_postnorm1, log_error=log_err, pow2scale=pow2scale)
         self.attn = HGRNBitAttention(
             mode=config.attn_mode,
             hidden_size=config.hidden_size,
@@ -297,9 +326,9 @@ class HGRNBitBlock(nn.Module):
             layer_idx=layer_idx,
             quantization_cfg=quantization_cfg,
         )
-        self.quant_attn = OptionalFakeQuantize(qconfig.quant_attn, log_error=log_err)
+        self.quant_attn = OptionalFakeQuantize(qconfig.quant_attn, log_error=log_err, pow2scale=pow2scale)
         self.mlp_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
-        self.quant_mlpnorm = OptionalFakeQuantize(qconfig.quant_mlpnorm, log_error=log_err)
+        self.quant_mlpnorm = OptionalFakeQuantize(qconfig.quant_mlpnorm, log_error=log_err, pow2scale=pow2scale)
         self.mlp = HGRNBitMLP(
             hidden_size=config.hidden_size,
             hidden_ratio=config.hidden_ratio,
@@ -307,8 +336,8 @@ class HGRNBitBlock(nn.Module):
             hidden_act=config.hidden_act,
             quantization_cfg=quantization_cfg,
         )
-        self.quant_mlp = OptionalFakeQuantize(qconfig.quant_mlp, log_error=log_err)
-        self.quant_residadd = OptionalFakeQuantize(qconfig.quant_residadd, log_error=log_err)
+        self.quant_mlp = OptionalFakeQuantize(qconfig.quant_mlp, log_error=log_err, pow2scale=pow2scale)
+        self.quant_residadd = OptionalFakeQuantize(qconfig.quant_residadd, log_error=log_err, pow2scale=pow2scale)
 
     def forward(
         self,
@@ -323,8 +352,9 @@ class HGRNBitBlock(nn.Module):
         hidden_states = self.quant_input(hidden_states)  # NOTE: quantization
         residual = hidden_states
 
-        hidden_states = self.attn_norm(hidden_states)
-        hidden_states = self.quant_postnorm1(hidden_states)  # NOTE: quantization
+        if not self.remove_double_rmsnorms:
+            hidden_states = self.attn_norm(hidden_states)
+            hidden_states = self.quant_postnorm1(hidden_states)  # NOTE: quantization
 
         hidden_states, attentions, past_key_values = self.attn(
             hidden_states=hidden_states,
@@ -336,8 +366,9 @@ class HGRNBitBlock(nn.Module):
         )
         hidden_states = self.quant_attn(hidden_states)  # NOTE: quantization
 
-        hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
-        hidden_states = self.quant_mlpnorm(hidden_states)  # NOTE: quantization
+        if not self.remove_double_rmsnorms:
+            hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
+            hidden_states = self.quant_mlpnorm(hidden_states)  # NOTE: quantization
 
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.quant_mlp(hidden_states)  # NOTE: quantization
@@ -403,6 +434,7 @@ class HGRNBitModel(HGRNBitPreTrainedModel):
         # NOTE(stevenabreu): for now we will ignore the embedding for quantization
         self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         assert quantization_cfg.quant_embedding is None, "Quantization of embedding is not supported yet."
+        pow2scale = quantization_cfg.act_quant_pow2scale
 
         if config.use_lower_bound:
             self.lower_bounds = nn.Parameter(torch.zeros(config.num_hidden_layers, config.hidden_size))
@@ -411,8 +443,10 @@ class HGRNBitModel(HGRNBitPreTrainedModel):
             for layer_idx in range(config.num_hidden_layers)
         ])
 
+        self.remove_double_rmsnorm_final = quantization_cfg.remove_double_rmsnorm_final
+
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.quant_norm = OptionalFakeQuantize(precision=quantization_cfg.quant_norm, log_error=quantization_cfg.log_local_quant_errors)
+        self.quant_norm = OptionalFakeQuantize(precision=quantization_cfg.quant_norm, log_error=quantization_cfg.log_local_quant_errors, pow2scale=pow2scale)
 
         self.gradient_checkpointing = False
 
@@ -504,7 +538,8 @@ class HGRNBitModel(HGRNBitPreTrainedModel):
             if output_attentions:
                 all_attns += (attentions,)
 
-        hidden_states = self.norm(hidden_states)
+        if not self.remove_double_rmsnorm_final:
+            hidden_states = self.norm(hidden_states)
         hidden_states = self.quant_norm(hidden_states)  # NOTE: quantization
 
         # add hidden states from the last decoder layer
@@ -532,7 +567,7 @@ class HGRNBitForCausalLM(HGRNBitPreTrainedModel):
 
         if quantization_cfg is None:
             quantization_cfg = QuantizationConfig.NoneConfig()
-        
+
         if quantization_cfg.unfused_bitlinear:
             BitLinear = partial(UnfusedBitLinear, use_naive_norm=quantization_cfg.naive_rmsnorm)
         else:

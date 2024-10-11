@@ -14,6 +14,7 @@ class HGRNBitAttentionQuantizationConfig:
     unfused_recurrent: bool = False
     naive_rmsnormswish: bool = False
     naive_swiglu: bool = False
+    quant_rec_ht: ty.Optional[int] = None
 
 
 @dataclass
@@ -24,6 +25,7 @@ class HGRNBitMLPQuantizationConfig:
 
 @dataclass
 class HGRNBitBlockQuantizationConfig:
+    remove_double_rmsnorms: bool = False
     quant_input: ty.Optional[int] = 8
     quant_postnorm1: ty.Optional[int] = 8
     quant_attn: ty.Optional[int] = 8
@@ -43,11 +45,14 @@ class QuantizationConfig:
     log_local_quant_errors: bool = False
     unfused_bitlinear: bool = False
     naive_rmsnorm: bool = False
+    act_quant_pow2scale: bool = False
+    remove_double_rmsnorm_final: bool = False
 
     @staticmethod
     def NoneConfig():
         return QuantizationConfig(
             hgrnbitblock_config = HGRNBitBlockQuantizationConfig(
+                remove_double_rmsnorms=False,
                 quant_input=None,
                 quant_postnorm1=None,
                 quant_attn=None,
@@ -59,18 +64,21 @@ class QuantizationConfig:
                     unfused_recurrent=False,
                     naive_rmsnormswish=False,
                     naive_swiglu=False,
+                    quant_rec_ht=None,
                 ),
                 mlp_config=HGRNBitMLPQuantizationConfig(
                     quant=None,
                     naive_swiglu=False,
                 )
             ),
+            remove_double_rmsnorm_final=False,
             quant_norm=None,
             quant_embedding=None,
             quant_lm_head=None,
             log_local_quant_errors=False,
             unfused_bitlinear=False,
             naive_rmsnorm=False,
+            act_quant_pow2scale=False,
         )
 
 
@@ -80,12 +88,14 @@ class CustomFakeQuantize(nn.Module):
                  qscheme=torch.per_tensor_symmetric, 
                  observer=MinMaxObserver,
                  log_error=True,
+                 pow2scale=False,
         ):
         super().__init__()
 
         assert precision <= 32, "precision must be <= 32"
 
         self.precision = precision
+        self.pow2scale = pow2scale
         self.quant_min = -(2**(precision - 1))
         self.quant_max = 2**(precision - 1) - 1
         self.dtype = torch.qint8 if precision <= 8 else torch.qint32
@@ -161,9 +171,13 @@ class CustomFakeQuantize(nn.Module):
         if self.qscheme == torch.per_tensor_symmetric:
             max_abs = torch.max(-min_val, max_val)
             self.scale = max_abs / ((self.quant_max - self.quant_min) / 2)
+            if self.pow2scale:
+                self.scale = 2 ** torch.round(torch.log2(self.scale))
             self.zero_point = 0
         elif self.qscheme == torch.per_tensor_affine:
             self.scale = (max_val - min_val) / (self.quant_max - self.quant_min)
+            if self.pow2scale:
+                self.scale = 2 ** torch.round(torch.log2(self.scale))
             self.zero_point = self.quant_min - torch.round(min_val / self.scale)
             self.zero_point = self.zero_point.clamp(self.quant_min, self.quant_max)
         else:
