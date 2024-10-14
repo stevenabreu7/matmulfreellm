@@ -537,7 +537,7 @@ def layer_norm_linear_quant_fn(
 
 
 class RMSNormNaive(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6, elementwise_affine=True, bias=False):
+    def __init__(self, hidden_size, eps=1e-5, elementwise_affine=True, bias=False):
         """
         Initializes the RMSNorm layer.
 
@@ -554,29 +554,27 @@ class RMSNormNaive(nn.Module):
 
         if self.elementwise_affine:
             self.weight = nn.Parameter(torch.ones(hidden_size))
-            if bias:
-                self.bias = nn.Parameter(torch.zeros(hidden_size))
         else:
             self.register_parameter('weight', None)
-            self.register_parameter('bias', None)
+
+        assert bias is False, "Bias is not supported in RMSNormNaive"
+        self.register_parameter('bias', None)
 
     def forward(self, x, residual=None):
-        # Add residual if provided
+        dtype = x.dtype
+        if x.dtype == torch.float16:
+            x = x.float()
+
         if residual is not None:
+            if residual.dtype == torch.float16:
+                residual = residual.float()
             x = x + residual
 
-        # Compute RMS
-        rms = x.pow(2).mean(dim=-1, keepdim=True).sqrt()
+        rms = torch.sqrt(x.square().mean(dim=-1, keepdim=True) + self.eps)
+        x_norm = x / rms
+        x_norm = x_norm * self.weight
 
-        # Normalize
-        x_norm = x / (rms + self.eps)
-
-        # Apply weight and bias if they exist
-        if self.elementwise_affine:
-            x_norm = x_norm * self.weight
-            if self.use_bias:
-                x_norm = x_norm + self.bias
-
+        x_norm = x_norm.to(dtype)
         return x_norm
 
 
