@@ -10,16 +10,17 @@ from transformers.activations import ACT2FN
 
 @dataclass
 class HGRNBitAttentionQuantizationConfig:
-    quant: bool = False
+    quant: ty.Optional[int] = None
+    quant_rec_ht: ty.Optional[int] = None
     unfused_recurrent: bool = False
     naive_rmsnormswish: bool = False
     naive_swiglu: bool = False
-    quant_rec_ht: ty.Optional[int] = None
+    unfused_bitlinear: bool = False
 
 
 @dataclass
 class HGRNBitMLPQuantizationConfig:
-    quant: bool = False
+    quant: ty.Optional[int] = None
     naive_swiglu: bool = False
 
 
@@ -42,11 +43,11 @@ class QuantizationConfig:
     quant_norm: ty.Optional[int] = 8
     quant_embedding: ty.Optional[int] = None
     quant_lm_head: ty.Optional[int] = None
+    remove_double_rmsnorm_final: bool = False
     log_local_quant_errors: bool = False
     unfused_bitlinear: bool = False
     naive_rmsnorm: bool = False
     act_quant_pow2scale: bool = False
-    remove_double_rmsnorm_final: bool = False
 
     @staticmethod
     def NoneConfig():
@@ -61,20 +62,21 @@ class QuantizationConfig:
                 quant_residadd=None,
                 attn_config=HGRNBitAttentionQuantizationConfig(
                     quant=None,
+                    quant_rec_ht=None,
                     unfused_recurrent=False,
                     naive_rmsnormswish=False,
                     naive_swiglu=False,
-                    quant_rec_ht=None,
+                    unfused_bitlinear=False,
                 ),
                 mlp_config=HGRNBitMLPQuantizationConfig(
                     quant=None,
                     naive_swiglu=False,
                 )
             ),
-            remove_double_rmsnorm_final=False,
             quant_norm=None,
             quant_embedding=None,
             quant_lm_head=None,
+            remove_double_rmsnorm_final=False,
             log_local_quant_errors=False,
             unfused_bitlinear=False,
             naive_rmsnorm=False,
@@ -84,7 +86,7 @@ class QuantizationConfig:
 
 class CustomFakeQuantize(nn.Module):
     def __init__(self, 
-                 precision=8,
+                 precision,
                  qscheme=torch.per_tensor_symmetric, 
                  observer=MinMaxObserver,
                  log_error=True,
@@ -92,7 +94,8 @@ class CustomFakeQuantize(nn.Module):
         ):
         super().__init__()
 
-        assert precision <= 32, "precision must be <= 32"
+        assert isinstance(precision, int), "precision must be an integer"
+        assert 2 <= precision <= 32, "precision must be in [2, 32]"
 
         self.precision = precision
         self.pow2scale = pow2scale
@@ -186,7 +189,7 @@ class CustomFakeQuantize(nn.Module):
     def quantize_dequantize(self, x):
         # Quantize
         x_quantized = x / self.scale + self.zero_point
-        if self.dtype == torch.qint8 or self.dtype == torch.quint8:
+        if self.dtype in (torch.qint8, torch.qint32):
             x_quantized = x_quantized.clamp(self.quant_min, self.quant_max)
         else:
             raise ValueError(f'Unsupported dtype: {self.dtype}')
@@ -209,7 +212,10 @@ class OptionalFakeQuantize(nn.Module):
     def __init__(self, precision: ty.Optional[int] = None, **kwargs):
         super().__init__()
         self.precision = precision
-        self.maybe_quant = CustomFakeQuantize(**kwargs) if self.precision is not None else DummyQuantize()
+        if self.precision is not None and isinstance(self.precision, int):
+            self.maybe_quant = CustomFakeQuantize(precision=precision, **kwargs)
+        else:
+            self.maybe_quant = DummyQuantize()
 
     def forward(self, x):
         return self.maybe_quant(x)
