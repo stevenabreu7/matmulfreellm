@@ -29,6 +29,7 @@ from mmfreelm.modules import FusedCrossEntropyLoss, RMSNorm, FusedRMSNormSwishGa
 from mmfreelm.modules.activations import swiglu
 from mmfreelm.ops.fusedbitnet import FusedBitLinear as FusedBitLinear
 from mmfreelm.ops.fusedbitnet import BitLinear as UnfusedBitLinear
+from mmfreelm.ops.fusedbitnet import RMSNormNaive
 from mmfreelm.ops.hgrn.recurrent_fuse import fused_recurrent_hgrn
 from mmfreelm.ops.hgrn.naive import naive_recurrent_hgrn
 
@@ -313,8 +314,11 @@ class HGRNBitBlock(nn.Module):
         pow2scale = quantization_cfg.act_quant_pow2scale
         log_err = quantization_cfg.log_local_quant_errors
         qconfig = quantization_cfg.hgrnbitblock_config
+        self.naive_rms_norm = quantization_cfg.naive_rmsnorm
+        rms_norm_cls = RMSNormNaive if self.naive_rms_norm else RMSNorm
+
         self.quant_input = OptionalFakeQuantize(qconfig.quant_input, log_error=log_err, pow2scale=pow2scale)
-        self.attn_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
+        self.attn_norm = rms_norm_cls(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
         self.quant_postnorm1 = OptionalFakeQuantize(qconfig.quant_postnorm1, log_error=log_err, pow2scale=pow2scale)
         self.attn = HGRNBitAttention(
             mode=config.attn_mode,
@@ -329,7 +333,7 @@ class HGRNBitBlock(nn.Module):
             quantization_cfg=quantization_cfg,
         )
         self.quant_attn = OptionalFakeQuantize(qconfig.quant_attn, log_error=log_err, pow2scale=pow2scale)
-        self.mlp_norm = RMSNorm(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp_norm = rms_norm_cls(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
         self.quant_mlpnorm = OptionalFakeQuantize(qconfig.quant_mlpnorm, log_error=log_err, pow2scale=pow2scale)
         self.mlp = HGRNBitMLP(
             hidden_size=config.hidden_size,
@@ -447,8 +451,10 @@ class HGRNBitModel(HGRNBitPreTrainedModel):
         ])
 
         self.remove_double_rmsnorm_final = quantization_cfg.remove_double_rmsnorm_final
+        self.naive_rms_norm = quantization_cfg.naive_rmsnorm
+        rms_norm_cls = RMSNormNaive if self.naive_rms_norm else RMSNorm
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
         self.quant_norm = OptionalFakeQuantize(precision=quantization_cfg.quant_norm, log_error=quantization_cfg.log_local_quant_errors, pow2scale=pow2scale)
 
         self.gradient_checkpointing = False

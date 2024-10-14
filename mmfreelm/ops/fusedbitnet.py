@@ -557,10 +557,11 @@ class RMSNormNaive(nn.Module):
         else:
             self.register_parameter('weight', None)
 
+        assert elementwise_affine, "Only elementwise affine is supported in RMSNormNaive"
         assert bias is False, "Bias is not supported in RMSNormNaive"
         self.register_parameter('bias', None)
 
-    def forward(self, x, residual=None):
+    def forward(self, x, residual=None, prenorm=False, residual_in_fp32=False):
         dtype = x.dtype
         if x.dtype == torch.float16:
             x = x.float()
@@ -569,13 +570,27 @@ class RMSNormNaive(nn.Module):
             if residual.dtype == torch.float16:
                 residual = residual.float()
             x = x + residual
+        
+        if prenorm:
+            residual_out = x.clone()
 
         rms = torch.sqrt(x.square().mean(dim=-1, keepdim=True) + self.eps)
         x_norm = x / rms
-        x_norm = x_norm * self.weight
 
+        # make sure w is also fp32, then apply
+        w = self.weight
+        if x_norm.dtype != w.dtype:
+            w = w.to(x_norm.dtype)
+        x_norm = x_norm * w
+
+        # restore to original dtype
         x_norm = x_norm.to(dtype)
-        return x_norm
+
+        if prenorm:
+            residual_out = residual_out.to(dtype)
+            return x_norm, residual_out
+        else:
+            return x_norm
 
 
 class BitLinear(nn.Linear):
