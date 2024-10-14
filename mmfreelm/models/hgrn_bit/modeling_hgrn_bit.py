@@ -86,7 +86,7 @@ class HGRNBitAttention(nn.Module):
         assert mode in ['fused_recurrent'], f"Not suppoerted mode `{mode}`."
         assert self.hidden_size % num_heads == 0, f"hidden size must be divisible by num_heads of {num_heads}"
 
-        if quantization_cfg.unfused_bitlinear:
+        if quantization_cfg.hgrnbitblock_config.attn_config.unfused_bitlinear:
             BitLinear = partial(UnfusedBitLinear, use_naive_norm=quantization_cfg.naive_rmsnorm)
         else:
             BitLinear = FusedBitLinear
@@ -258,6 +258,7 @@ class HGRNBitMLP(nn.Module):
         hidden_act: str = 'swish',
         intermediate_size: Optional[int] = None,
         quantization_cfg = None,
+        layer_idx = None
     ) -> HGRNBitMLP:
         super().__init__()
 
@@ -268,6 +269,7 @@ class HGRNBitMLP(nn.Module):
         self.naive_swiglu = quantization_cfg.hgrnbitblock_config.mlp_config.naive_swiglu
 
         self.hidden_size = hidden_size
+        self.layer_idx = layer_idx
         # the final number of params is `hidden_ratio * hidden_size^2`
         # `intermediate_size` is chosen to be a multiple of 256 closest to `2/3 * hidden_size * hidden_ratio`
         if hidden_ratio is None:
@@ -283,7 +285,7 @@ class HGRNBitMLP(nn.Module):
         else:
             BitLinear = FusedBitLinear
 
-        self.gate_proj = BitLinear(self.hidden_size, self.intermediate_size * 2, bias=False, )
+        self.gate_proj = BitLinear(self.hidden_size, self.intermediate_size * 2, bias=False)
         self.quant_gate = OptionalFakeQuantize(quant, log_error=log_err, pow2scale=pow2scale)
         self.quant_swiglu = OptionalFakeQuantize(quant, log_error=log_err, pow2scale=pow2scale)
         self.down_proj = BitLinear(self.intermediate_size, self.hidden_size, bias=False)
@@ -335,6 +337,7 @@ class HGRNBitBlock(nn.Module):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quantization_cfg=quantization_cfg,
+            layer_idx=layer_idx,
         )
         self.quant_mlp = OptionalFakeQuantize(qconfig.quant_mlp, log_error=log_err, pow2scale=pow2scale)
         self.quant_residadd = OptionalFakeQuantize(qconfig.quant_residadd, log_error=log_err, pow2scale=pow2scale)
