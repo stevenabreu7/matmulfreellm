@@ -537,7 +537,15 @@ def layer_norm_linear_quant_fn(
 
 
 class RMSNormNaive(nn.Module):
-    def __init__(self, hidden_size, eps=1e-5, elementwise_affine=True, bias=False):
+    def __init__(
+        self,
+        hidden_size,
+        eps=1e-5,
+        elementwise_affine=True,
+        bias=False,
+        override_eps_zero=False,
+        override_eps_1em3=False,
+    ):
         """
         Initializes the RMSNorm layer.
 
@@ -551,6 +559,12 @@ class RMSNormNaive(nn.Module):
         self.eps = eps
         self.elementwise_affine = elementwise_affine
         self.use_bias = bias
+
+        assert not (override_eps_zero and override_eps_1em3), "Cannot override both eps=0 and eps=1e-3"
+        if override_eps_zero:
+            self.eps = 0.0
+        elif override_eps_1em3:
+            self.eps = 1e-3
 
         if self.elementwise_affine:
             self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -574,8 +588,12 @@ class RMSNormNaive(nn.Module):
         if prenorm:
             residual_out = x.clone()
 
-        rms = torch.sqrt(x.square().mean(dim=-1, keepdim=True) + self.eps)
-        x_norm = x / rms
+        ms = x.square().mean(dim=-1, keepdim=True) + self.eps
+        if self.eps > 0.0:
+            rms = torch.sqrt(ms)
+            x_norm = x / rms
+        else:
+            x_norm = x * 0.0
 
         # make sure w is also fp32, then apply
         w = self.weight
@@ -599,7 +617,15 @@ class BitLinear(nn.Linear):
     This is primarily for training; kernel optimization is needed for efficiency in deployment.
     """
 
-    def __init__(self, in_features, out_features, bias=False, use_naive_norm=False):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        bias=False,
+        use_naive_norm=False,
+        override_eps_zero=False,
+        override_eps_1em3=False,
+    ):
         """
         Initializes the BitLinear layer.
 
@@ -611,7 +637,12 @@ class BitLinear(nn.Linear):
         # Initialize the superclass nn.Linear with the given parameters
         super(BitLinear, self).__init__(in_features, out_features, bias=bias)
         if use_naive_norm:
-            self.norm = RMSNormNaive(in_features, eps=1e-8)
+            self.norm = RMSNormNaive(
+                in_features,
+                eps=1e-8,
+                override_eps_zero=override_eps_zero,
+                override_eps_1em3=override_eps_1em3
+            )
         else:
             self.norm = RMSNorm(in_features, eps=1e-8)
 

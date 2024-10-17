@@ -88,7 +88,12 @@ class HGRNBitAttention(nn.Module):
         assert self.hidden_size % num_heads == 0, f"hidden size must be divisible by num_heads of {num_heads}"
 
         if quantization_cfg.hgrnbitblock_config.attn_config.unfused_bitlinear:
-            BitLinear = partial(UnfusedBitLinear, use_naive_norm=quantization_cfg.naive_rmsnorm)
+            BitLinear = partial(
+                UnfusedBitLinear,
+                use_naive_norm=quantization_cfg.naive_rmsnorm,
+                override_eps_zero=quantization_cfg.override_eps_zero,
+                override_eps_1em3=quantization_cfg.override_eps_1em3,
+            )
         else:
             BitLinear = FusedBitLinear
 
@@ -114,8 +119,14 @@ class HGRNBitAttention(nn.Module):
 
         self.g_proj = BitLinear(hidden_size, self.input_dim, bias=False)
         if self.naive_rmsnormswish:
-            self.g_norm = FusedRMSNormSwishGateNaive(self.input_dim, eps=layernorm_eps, 
-                                                     quant=quant, log_error=log_err)
+            self.g_norm = FusedRMSNormSwishGateNaive(
+                self.input_dim,
+                eps=layernorm_eps,
+                quant=quant,
+                log_error=log_err,
+                override_eps_zero=quantization_cfg.override_eps_zero,
+                override_eps_1em3=quantization_cfg.override_eps_1em3,
+            )
         else:
             self.g_norm = FusedRMSNormSwishGate(self.input_dim, layernorm_eps)
 
@@ -282,7 +293,12 @@ class HGRNBitMLP(nn.Module):
         self.intermediate_size = intermediate_size
 
         if quantization_cfg.unfused_bitlinear:
-            BitLinear = partial(UnfusedBitLinear, use_naive_norm=quantization_cfg.naive_rmsnorm)
+            BitLinear = partial(
+                UnfusedBitLinear,
+                use_naive_norm=quantization_cfg.naive_rmsnorm,
+                override_eps_zero=quantization_cfg.override_eps_zero,
+                override_eps_1em3=quantization_cfg.override_eps_1em3,
+            )
         else:
             BitLinear = FusedBitLinear
 
@@ -315,7 +331,13 @@ class HGRNBitBlock(nn.Module):
         log_err = quantization_cfg.log_local_quant_errors
         qconfig = quantization_cfg.hgrnbitblock_config
         self.naive_rms_norm = quantization_cfg.naive_rmsnorm
-        rms_norm_cls = RMSNormNaive if self.naive_rms_norm else RMSNorm
+        rms_norm_cls = RMSNorm
+        if self.naive_rms_norm:
+            rms_norm_cls = partial(
+                RMSNormNaive,
+                override_eps_zero=quantization_cfg.override_eps_zero,
+                override_eps_1em3=quantization_cfg.override_eps_1em3,
+            )
 
         self.quant_input = OptionalFakeQuantize(qconfig.quant_input, log_error=log_err, pow2scale=pow2scale)
         self.attn_norm = rms_norm_cls(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
@@ -452,7 +474,13 @@ class HGRNBitModel(HGRNBitPreTrainedModel):
 
         self.remove_double_rmsnorm_final = quantization_cfg.remove_double_rmsnorm_final
         self.naive_rms_norm = quantization_cfg.naive_rmsnorm
-        rms_norm_cls = RMSNormNaive if self.naive_rms_norm else RMSNorm
+        rms_norm_cls = RMSNorm
+        if self.naive_rms_norm:
+            rms_norm_cls = partial(
+                RMSNormNaive,
+                override_eps_zero=quantization_cfg.override_eps_zero,
+                override_eps_1em3=quantization_cfg.override_eps_1em3,
+            )
 
         self.norm = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
         self.quant_norm = OptionalFakeQuantize(precision=quantization_cfg.quant_norm, log_error=quantization_cfg.log_local_quant_errors, pow2scale=pow2scale)
@@ -578,7 +606,12 @@ class HGRNBitForCausalLM(HGRNBitPreTrainedModel):
             quantization_cfg = QuantizationConfig.NoneConfig()
 
         if quantization_cfg.unfused_bitlinear:
-            BitLinear = partial(UnfusedBitLinear, use_naive_norm=quantization_cfg.naive_rmsnorm)
+            BitLinear = partial(
+                UnfusedBitLinear,
+                use_naive_norm=quantization_cfg.naive_rmsnorm,
+                override_eps_zero=quantization_cfg.override_eps_zero,
+                override_eps_1em3=quantization_cfg.override_eps_1em3,
+            )
         else:
             BitLinear = FusedBitLinear
 

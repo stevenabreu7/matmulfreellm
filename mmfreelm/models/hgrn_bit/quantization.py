@@ -48,6 +48,8 @@ class QuantizationConfig:
     unfused_bitlinear: bool = False
     naive_rmsnorm: bool = False
     act_quant_pow2scale: bool = False
+    override_eps_1em3: bool = False
+    override_eps_zero: bool = False
 
     @staticmethod
     def NoneConfig():
@@ -81,6 +83,8 @@ class QuantizationConfig:
             unfused_bitlinear=False,
             naive_rmsnorm=False,
             act_quant_pow2scale=False,
+            override_eps_1em3=False,
+            override_eps_zero=False
         )
 
 
@@ -252,7 +256,7 @@ def swiglu_naive(x, y):
 
 
 class FusedRMSNormSwishGateNaive(nn.Module):
-    def __init__(self, hidden_size, eps=1e-5, quant=None, log_error=False):
+    def __init__(self, hidden_size, eps=1e-5, quant=None, log_error=False, override_eps_zero=False, override_eps_1em3=False):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -260,10 +264,21 @@ class FusedRMSNormSwishGateNaive(nn.Module):
         self.quant_gnorm = OptionalFakeQuantize(quant, log_error=log_error)
         self.quant_swish = OptionalFakeQuantize(quant, log_error=log_error)
 
+        assert not (override_eps_zero and override_eps_1em3), "Cannot override both eps=0 and eps=1e-3"
+        if override_eps_zero:
+            self.eps = 0.0
+        elif override_eps_1em3:
+            self.eps = 1e-3
+
     def rms_norm(self, x):
         # Root mean square normalization
-        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
-        return x / rms * self.weight
+        ms = x.square().mean(dim=-1, keepdim=True) + self.eps
+        if self.eps > 0.0:
+            rms = torch.sqrt(ms)
+            x_norm = x / rms
+        else:
+            x_norm = x * 0.0
+        return x_norm * self.weight
 
     def swish_gate(self, o):
         # Swish gate: o * sigmoid(o)
