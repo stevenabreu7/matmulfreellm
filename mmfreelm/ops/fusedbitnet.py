@@ -10,6 +10,7 @@ import triton.language as tl
 
 from mmfreelm.modules import RMSNorm
 from mmfreelm.utils import contiguous
+from mmfreelm.models.hgrn_bit.quantization import OptionalFakeQuantize
 
 
 def activation_quant(x):
@@ -545,6 +546,7 @@ class RMSNormNaive(nn.Module):
         bias=False,
         override_eps_zero=False,
         override_eps_1em3=False,
+        quant_rms=None,
     ):
         """
         Initializes the RMSNorm layer.
@@ -565,6 +567,10 @@ class RMSNormNaive(nn.Module):
             self.eps = 0.0
         elif override_eps_1em3:
             self.eps = 1e-3
+
+        self.quant_ms = OptionalFakeQuantize(quant_rms)
+        self.quant_rms = OptionalFakeQuantize(quant_rms)
+        self.quant_rms_inv = OptionalFakeQuantize(quant_rms)
 
         if self.elementwise_affine:
             self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -589,9 +595,12 @@ class RMSNormNaive(nn.Module):
             residual_out = x.clone()
 
         ms = x.square().mean(dim=-1, keepdim=True) + self.eps
+        ms = self.quant_ms(ms)
         if self.eps > 0.0:
             rms = torch.sqrt(ms)
+            rms = self.quant_rms(rms)
             x_norm = x / rms
+            x_norm = self.quant_rms_inv(x_norm)
         else:
             x_norm = x * 0.0
 
@@ -625,6 +634,7 @@ class BitLinear(nn.Linear):
         use_naive_norm=False,
         override_eps_zero=False,
         override_eps_1em3=False,
+        quant_rms=None,
     ):
         """
         Initializes the BitLinear layer.
@@ -641,7 +651,8 @@ class BitLinear(nn.Linear):
                 in_features,
                 eps=1e-8,
                 override_eps_zero=override_eps_zero,
-                override_eps_1em3=override_eps_1em3
+                override_eps_1em3=override_eps_1em3,
+                quant_rms=quant_rms,
             )
         else:
             self.norm = RMSNorm(in_features, eps=1e-8)

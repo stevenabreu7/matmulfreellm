@@ -50,6 +50,7 @@ class QuantizationConfig:
     act_quant_pow2scale: bool = False
     override_eps_1em3: bool = False
     override_eps_zero: bool = False
+    rms_quant_act: ty.Optional[int] = None
 
     @staticmethod
     def NoneConfig():
@@ -84,7 +85,8 @@ class QuantizationConfig:
             naive_rmsnorm=False,
             act_quant_pow2scale=False,
             override_eps_1em3=False,
-            override_eps_zero=False
+            override_eps_zero=False,
+            rms_quant_act=None,
         )
 
 
@@ -93,7 +95,7 @@ class CustomFakeQuantize(nn.Module):
                  precision,
                  qscheme=torch.per_tensor_symmetric, 
                  observer=MinMaxObserver,
-                 log_error=True,
+                 log_error=False,
                  pow2scale=False,
         ):
         super().__init__()
@@ -256,13 +258,26 @@ def swiglu_naive(x, y):
 
 
 class FusedRMSNormSwishGateNaive(nn.Module):
-    def __init__(self, hidden_size, eps=1e-5, quant=None, log_error=False, override_eps_zero=False, override_eps_1em3=False):
+    def __init__(
+        self,
+        hidden_size,
+        eps=1e-5,
+        quant=None,
+        log_error=False,
+        override_eps_zero=False,
+        override_eps_1em3=False,
+        quant_rms=None,
+    ):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.bias = None  # No bias in this implementation
         self.quant_gnorm = OptionalFakeQuantize(quant, log_error=log_error)
         self.quant_swish = OptionalFakeQuantize(quant, log_error=log_error)
+
+        self.quant_ms = OptionalFakeQuantize(quant_rms, log_error=log_error)
+        self.quant_rms = OptionalFakeQuantize(quant_rms, log_error=log_error)
+        self.quant_rms_inv = OptionalFakeQuantize(quant_rms, log_error=log_error)
 
         assert not (override_eps_zero and override_eps_1em3), "Cannot override both eps=0 and eps=1e-3"
         if override_eps_zero:
@@ -273,9 +288,12 @@ class FusedRMSNormSwishGateNaive(nn.Module):
     def rms_norm(self, x):
         # Root mean square normalization
         ms = x.square().mean(dim=-1, keepdim=True) + self.eps
+        ms = self.quant_ms(ms)
         if self.eps > 0.0:
             rms = torch.sqrt(ms)
+            rms = self.quant_rms(rms)
             x_norm = x / rms
+            x_norm = self.quant_rms_inv(rms)
         else:
             x_norm = x * 0.0
         return x_norm * self.weight
