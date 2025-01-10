@@ -459,10 +459,11 @@ class HGRNBitPreTrainedModel(PreTrainedModel):
 
 class HGRNBitModel(HGRNBitPreTrainedModel):
 
-    def __init__(self, config: HGRNBitConfig, quantization_cfg=None): 
+    def __init__(self, config: HGRNBitConfig, quantization_cfg=None, jetson=False): 
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.jetson = jetson
 
         # NOTE(stevenabreu): for now we will ignore the embedding for quantization
         self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
@@ -604,8 +605,9 @@ class HGRNBitModel(HGRNBitPreTrainedModel):
 class HGRNBitForCausalLM(HGRNBitPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config, quantization_cfg=None):
+    def __init__(self, config, quantization_cfg=None, jetson=False):
         super().__init__(config)
+        print("called my init")
 
         if quantization_cfg is None:
             quantization_cfg = QuantizationConfig.NoneConfig()
@@ -621,7 +623,7 @@ class HGRNBitForCausalLM(HGRNBitPreTrainedModel):
         else:
             BitLinear = FusedBitLinear
 
-        self.model = HGRNBitModel(config, quantization_cfg=quantization_cfg)
+        self.model = HGRNBitModel(config, quantization_cfg=quantization_cfg, jetson=jetson)
         self.vocab_size = config.vocab_size
         # NOTE(stevenabreu): we can ignore the lm_head for quantization (it's bitlinear)
         assert quantization_cfg.quant_lm_head is None, "Quantization of LM head is not supported yet."
