@@ -89,6 +89,42 @@ class QuantizationConfig:
             rms_quant_act=None,
         )
 
+    @staticmethod
+    def NaiveConfig():
+        return QuantizationConfig(
+            hgrnbitblock_config = HGRNBitBlockQuantizationConfig(
+                remove_double_rmsnorms=False,
+                quant_input=None,
+                quant_postnorm1=None,
+                quant_attn=None,
+                quant_mlpnorm=None,
+                quant_mlp=None,
+                quant_residadd=None,
+                attn_config=HGRNBitAttentionQuantizationConfig(
+                    quant=None,
+                    quant_rec_ht=None,
+                    unfused_recurrent=True,  # naive
+                    naive_rmsnormswish=True,  # naive
+                    naive_swiglu=True,  # naive
+                    unfused_bitlinear=True,  # naive
+                ),
+                mlp_config=HGRNBitMLPQuantizationConfig(
+                    quant=None,
+                    naive_swiglu=True,  # naive
+                )
+            ),
+            quant_norm=None,
+            quant_embedding=None,
+            quant_lm_head=None,
+            remove_double_rmsnorm_final=False,
+            log_local_quant_errors=False,
+            unfused_bitlinear=True,  # naive
+            naive_rmsnorm=True,  # naive
+            act_quant_pow2scale=False,
+            override_eps_1em3=False,
+            override_eps_zero=False,
+            rms_quant_act=None,
+        )
 
 class CustomFakeQuantize(nn.Module):
     def __init__(self, 

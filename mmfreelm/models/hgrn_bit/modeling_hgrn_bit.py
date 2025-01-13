@@ -25,13 +25,59 @@ from mmfreelm.models.hgrn_bit.quantization import (
 )
 # from mmfreelm.layers.hgrn_bit import HGRNBitAttention  # NOTE: merged into this file!
 from mmfreelm.models.utils import RecurrentCache
-from mmfreelm.modules import FusedCrossEntropyLoss, RMSNorm, FusedRMSNormSwishGate, ShortConvolution
-from mmfreelm.modules.activations import swiglu
-from mmfreelm.ops.fusedbitnet import FusedBitLinear as FusedBitLinear
+# from mmfreelm.modules import FusedCrossEntropyLoss, RMSNorm, FusedRMSNormSwishGate, ShortConvolution
+# from mmfreelm.modules.activations import swiglu
+# from mmfreelm.ops.fusedbitnet import FusedBitLinear as FusedBitLinear
 from mmfreelm.ops.fusedbitnet import BitLinear as UnfusedBitLinear
 from mmfreelm.ops.fusedbitnet import RMSNormNaive
-from mmfreelm.ops.hgrn.recurrent_fuse import fused_recurrent_hgrn
+# from mmfreelm.ops.hgrn.recurrent_fuse import fused_recurrent_hgrn
 from mmfreelm.ops.hgrn.naive import naive_recurrent_hgrn
+
+
+
+class BitLinear(nn.Linear):
+    """
+    A custom linear layer that applies quantization on both activations and weights.
+    This is primarily for training; kernel optimization is needed for efficiency in deployment.
+    """
+
+    def __init__(self, in_features, out_features, bias=False):
+        """
+        Initializes the BitLinear layer.
+
+        Args:
+            in_features: Size of each input sample.
+            out_features: Size of each output sample.
+            bias: If set to False, the layer will not learn an additive bias. Default: True.
+        """
+        # Initialize the superclass nn.Linear with the given parameters
+        super(BitLinear, self).__init__(in_features, out_features, bias=bias)
+        self.norm = RMSNormNaive(in_features, eps=1e-8)
+
+    def forward(self, x):
+        """
+        Overrides the forward pass to include quantization.
+
+        Args:
+            x: An input tensor with shape [n, d].
+
+        Returns:
+            An output tensor with shape [n, d].
+        """
+        # Weight tensor
+        w = self.weight
+
+        # Apply RMS normalization to the input
+        x_norm = self.norm(x)
+
+        # Apply quantization to both activations and weights
+        # Uses Straight-Through Estimator (STE) trick with .detach() for gradient flow
+        x_quant = x_norm + (activation_quant(x_norm) - x_norm).detach()
+        w_quant = w + (weight_quant(w) - w).detach()
+        # Perform linear operation with quantized values
+        y = F.linear(x_quant, w_quant)
+
+        return y
 
 
 logger = logging.get_logger(__name__)
@@ -139,7 +185,7 @@ class HGRNBitAttention(nn.Module):
     def _initialize_weights(self, module):
         if getattr(module, "_is_hf_initialized", False):
             return
-        if isinstance(module, (nn.Linear, FusedBitLinear, UnfusedBitLinear)):
+        if isinstance(module, (nn.Linear, UnfusedBitLinear)):
             nn.init.xavier_uniform_(module.weight, gain=2 ** -2.5)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
@@ -334,7 +380,6 @@ class HGRNBitBlock(nn.Module):
         log_err = quantization_cfg.log_local_quant_errors
         qconfig = quantization_cfg.hgrnbitblock_config
         self.naive_rms_norm = quantization_cfg.naive_rmsnorm
-        rms_norm_cls = RMSNorm
         if self.naive_rms_norm:
             rms_norm_cls = partial(
                 RMSNormNaive,
@@ -342,6 +387,8 @@ class HGRNBitBlock(nn.Module):
                 override_eps_1em3=quantization_cfg.override_eps_1em3,
                 quant_rms=quantization_cfg.rms_quant_act,
             )
+        else:
+            rms_norm_cls = RMSNorm
 
         self.quant_input = OptionalFakeQuantize(qconfig.quant_input, log_error=log_err, pow2scale=pow2scale)
         self.attn_norm = rms_norm_cls(hidden_size=config.hidden_size, eps=config.rms_norm_eps)
@@ -478,7 +525,6 @@ class HGRNBitModel(HGRNBitPreTrainedModel):
 
         self.remove_double_rmsnorm_final = quantization_cfg.remove_double_rmsnorm_final
         self.naive_rms_norm = quantization_cfg.naive_rmsnorm
-        rms_norm_cls = RMSNorm
         if self.naive_rms_norm:
             rms_norm_cls = partial(
                 RMSNormNaive,
@@ -486,6 +532,8 @@ class HGRNBitModel(HGRNBitPreTrainedModel):
                 override_eps_1em3=quantization_cfg.override_eps_1em3,
                 quant_rms=quantization_cfg.rms_quant_act,
             )
+        else:
+            rms_norm_cls = RMSNorm
 
         self.norm = rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
         self.quant_norm = OptionalFakeQuantize(precision=quantization_cfg.quant_norm, log_error=quantization_cfg.log_local_quant_errors, pow2scale=pow2scale)
